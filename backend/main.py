@@ -30,6 +30,7 @@ from parsers.transcript_parser import parse_workday_transcript
 from integrations.workday_mock import WorkdayAdapter
 from ai.profile_analyzer import analyze_profile
 from ai.recommender import recommend_courses, recommend_projects, recommend_jobs, get_comparison_data
+from ai.intelligence import get_intelligence_provider
 
 app = FastAPI(
     title="Babson MBA Career Intelligence Platform",
@@ -180,7 +181,7 @@ async def analyze_student_profile(request: AnalyzeRequest):
     if not resume_data and not linkedin_data and not transcript_data:
         raise HTTPException(400, "No documents uploaded. Please upload at least one document.")
 
-    analysis = analyze_profile(resume_data, linkedin_data, transcript_data)
+    analysis = analyze_profile(resume_data, linkedin_data, transcript_data, session_id=request.session_id)
     session["analysis"] = analysis
 
     # Persist to DB
@@ -374,3 +375,9 @@ async def get_session(session_id: str):
 @app.get("/api/health")
 async def health():
     return {"status": "healthy", "version": "1.0.0"}
+
+
+@app.get("/api/intelligence/health")
+async def intelligence_health():
+    provider = get_intelligence_provider()
+    return provider.metadata()

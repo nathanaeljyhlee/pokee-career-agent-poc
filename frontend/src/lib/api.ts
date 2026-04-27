@@ -100,6 +100,7 @@ export async function getSession(sessionId: string) {
 export interface Analysis {
   skills_inventory: Record<string, { name: string; subcategory: string }[]>;
   total_skills_identified: number;
+  skill_evidence?: SkillEvidence[];
   entrepreneurship_readiness: {
     score: number;
     out_of: number;
@@ -117,6 +118,29 @@ export interface Analysis {
     immediate_actions: string[];
     entrepreneurship_assessment: string;
   } | null;
+  local_advisor?: {
+    summary: string;
+    strengths: string[];
+    development_areas: string[];
+    recommended_next_steps: string[];
+    explanation_sources: { type: "skill" | "course" | "project" | "job" | "transcript"; label: string }[];
+  } | null;
+  intelligence?: {
+    mode: "offline" | "online";
+    provider: "ollama" | "azure" | "deterministic";
+    model: string | null;
+    embedding_model: string | null;
+    fallback_used: boolean;
+    health: "ok" | "degraded" | "unavailable";
+    detail?: string;
+  };
+  performance?: {
+    extraction_ms: number;
+    embedding_ms: number;
+    scoring_ms: number;
+    advisor_ms: number;
+    cached_embeddings_used: number;
+  };
   transcript_summary: {
     gpa: number;
     credits_completed: number;
@@ -130,10 +154,22 @@ export interface CareerGap {
   career_path: string;
   industry: string;
   match_percentage: number;
+  semantic_match_score?: number;
+  combined_match_score?: number;
+  priority_missing_skills?: string[];
   matching_skills: string[];
   missing_essential_skills: string[];
   missing_common_skills: string[];
   fit_level: string;
+}
+
+export interface SkillEvidence {
+  skill: string;
+  raw_skill?: string;
+  evidence_text: string;
+  source: "resume" | "linkedin" | "transcript";
+  confidence: number;
+  evidence_type: "explicit" | "inferred" | "course_mapped";
 }
 
 export interface CourseRec {

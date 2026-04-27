@@ -1,11 +1,10 @@
 """
 Resume PDF parser — extracts structured data from uploaded resume PDFs.
 
-Uses PyMuPDF for text extraction and Claude for intelligent structuring.
-Falls back to rule-based extraction if Claude is unavailable.
+Uses PyMuPDF for text extraction and local provider evidence when available.
+Falls back to rule-based extraction if local AI is unavailable.
 """
 
-import json
 import re
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from ai.intelligence import get_intelligence_provider
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
@@ -27,65 +26,18 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
 
 def parse_with_ai(text: str) -> dict:
-    """Use Claude to extract structured resume data."""
-    if not ANTHROPIC_API_KEY:
-        return parse_rule_based(text)
-
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    prompt = f"""Analyze this resume text and extract structured data. Return ONLY valid JSON with these fields:
-
-{{
-  "name": "Full name",
-  "email": "Email address or null",
-  "phone": "Phone number or null",
-  "location": "City, State or null",
-  "summary": "Professional summary/objective (1-2 sentences)",
-  "education": [
-    {{
-      "institution": "School name",
-      "degree": "Degree type (e.g., MBA, BS)",
-      "field": "Field of study",
-      "graduation_year": 2024,
-      "gpa": 3.8
-    }}
-  ],
-  "experience": [
-    {{
-      "company": "Company name",
-      "title": "Job title",
-      "start_date": "Start date",
-      "end_date": "End date or Present",
-      "description": "Brief description",
-      "key_achievements": ["Achievement 1", "Achievement 2"]
-    }}
-  ],
-  "skills": ["Skill 1", "Skill 2"],
-  "certifications": ["Cert 1"],
-  "languages": ["English", "Spanish"],
-  "interests": ["Interest 1"]
-}}
-
-Resume text:
-{text[:8000]}"""
-
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
+    """Use the configured local provider to enrich rule-based resume parsing."""
+    parsed = parse_rule_based(text)
     try:
-        content = response.content[0].text
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if json_match:
-            return json.loads(json_match.group())
-    except (json.JSONDecodeError, IndexError):
+        provider = get_intelligence_provider()
+        if provider.health().status == "ok":
+            evidence = provider.extract_profile_evidence("resume", text)
+            parsed["skill_evidence"] = evidence
+            local_skills = [item["skill"] for item in evidence if item.get("skill") and item.get("confidence", 0) >= 0.55]
+            parsed["skills"] = sorted(set(parsed.get("skills", []) + local_skills))
+    except Exception:
         pass
-
-    return parse_rule_based(text)
+    return parsed
 
 
 def parse_rule_based(text: str) -> dict:

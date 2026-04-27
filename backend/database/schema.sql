@@ -121,6 +121,30 @@ CREATE TABLE IF NOT EXISTS student_profiles (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS ai_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(entity_type, entity_id, provider, model, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS skill_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    canonical_skill TEXT,
+    raw_skill TEXT NOT NULL,
+    source TEXT NOT NULL,
+    evidence_text TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK(confidence BETWEEN 0.0 AND 1.0),
+    match_method TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_job_outcomes_school ON job_outcomes(school_id);
 CREATE INDEX IF NOT EXISTS idx_job_outcomes_industry ON job_outcomes(industry);
 CREATE INDEX IF NOT EXISTS idx_job_skills_title ON job_skills(job_title);
@@ -128,3 +152,5 @@ CREATE INDEX IF NOT EXISTS idx_job_skills_skill ON job_skills(skill_id);
 CREATE INDEX IF NOT EXISTS idx_courses_school ON courses(school_id);
 CREATE INDEX IF NOT EXISTS idx_skill_synonyms_skill ON skill_synonyms(skill_id);
 CREATE INDEX IF NOT EXISTS idx_transferable_skills_skill ON transferable_skills(skill_id);
+CREATE INDEX IF NOT EXISTS idx_ai_embeddings_lookup ON ai_embeddings(entity_type, entity_id, provider, model, content_hash);
+CREATE INDEX IF NOT EXISTS idx_skill_evidence_session ON skill_evidence(session_id);

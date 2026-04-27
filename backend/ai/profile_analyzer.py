@@ -6,18 +6,18 @@ Uses Claude for intelligent analysis when API key is available,
 falls back to rule-based analysis otherwise.
 """
 
-import json
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
-from database.connection import query
-from scrapers.skills_normalizer import normalize_skill_list, quick_normalize
+from database.connection import execute, query
+from ai.intelligence import cache_embedding, get_cached_embedding, get_intelligence_provider
+from scrapers.skills_normalizer import quick_normalize
 
 
-def analyze_profile(resume_data: dict = None, linkedin_data: dict = None, transcript_data: dict = None) -> dict:
+def analyze_profile(resume_data: dict = None, linkedin_data: dict = None, transcript_data: dict = None, session_id: str = None) -> dict:
     """
     Analyze a student's combined profile and return:
     - Skills inventory (categorized)
@@ -26,25 +26,56 @@ def analyze_profile(resume_data: dict = None, linkedin_data: dict = None, transc
     - Strengths and development areas
     - Career path suggestions
     """
+    timings = {"extraction_ms": 0, "embedding_ms": 0, "scoring_ms": 0, "advisor_ms": 0, "cached_embeddings_used": 0}
+    provider = get_intelligence_provider()
+    provider_health = provider.health()
+    provider_available = provider_health.status == "ok"
+    fallback_used = not provider_available
+
+    extraction_start = time.perf_counter()
+
     # Collect all raw skills from all sources
     raw_skills = set()
+    skill_evidence = []
 
     if resume_data:
         raw_skills.update(resume_data.get("skills", []))
+        skill_evidence.extend(resume_data.get("skill_evidence", []))
         for exp in resume_data.get("experience", []):
             for achievement in exp.get("key_achievements", []):
                 _extract_implicit_skills(achievement, raw_skills)
 
     if linkedin_data:
         raw_skills.update(linkedin_data.get("skills", []))
+        skill_evidence.extend(linkedin_data.get("skill_evidence", []))
 
     if transcript_data:
         for course in transcript_data.get("courses", []):
             raw_skills.update(course.get("skills_covered", []))
+            for skill in course.get("skills_covered", []):
+                skill_evidence.append({
+                    "skill": skill,
+                    "evidence_text": course.get("name") or course.get("course_name") or course.get("code", ""),
+                    "source": "transcript",
+                    "confidence": 0.85,
+                    "evidence_type": "course_mapped",
+                })
+
+    if provider_available:
+        try:
+            skill_evidence.extend(_extract_missing_local_evidence(provider, "resume", resume_data))
+            skill_evidence.extend(_extract_missing_local_evidence(provider, "linkedin", linkedin_data))
+        except Exception:
+            fallback_used = True
+
+    for item in skill_evidence:
+        if item.get("confidence", 0) >= 0.55 and item.get("skill"):
+            raw_skills.add(item["skill"])
+
+    timings["extraction_ms"] = round((time.perf_counter() - extraction_start) * 1000)
 
     # Normalize skills
     normalized = []
-    skill_ids = set()
     for raw in raw_skills:
         quick = quick_normalize(raw)
         if quick:
@@ -58,26 +89,55 @@ def analyze_profile(resume_data: dict = None, linkedin_data: dict = None, transc
     # Calculate entrepreneurship readiness
     ent_score = _calculate_entrepreneurship_score(student_skill_names, transcript_data)
 
+    scoring_start = time.perf_counter()
+
     # Get skill gaps for common paths
     career_gaps = _analyze_career_gaps(student_skill_names)
+    timings["scoring_ms"] = round((time.perf_counter() - scoring_start) * 1000)
+
+    if provider_available:
+        embedding_start = time.perf_counter()
+        try:
+            career_gaps, cached_count = _add_semantic_scores(provider, student_skill_names, skill_evidence, career_gaps)
+            timings["cached_embeddings_used"] = cached_count
+        except Exception:
+            fallback_used = True
+        timings["embedding_ms"] = round((time.perf_counter() - embedding_start) * 1000)
 
     # Build experience summary
     experience_summary = _summarize_experience(resume_data, linkedin_data)
 
-    # AI-enhanced analysis if available
-    ai_insights = None
-    if ANTHROPIC_API_KEY:
-        ai_insights = _get_ai_insights(resume_data, linkedin_data, transcript_data, student_skill_names)
+    advisor_start = time.perf_counter()
+    local_advisor = None
+    if provider_available:
+        try:
+            local_advisor = provider.advise({
+                "skills": student_skill_names[:40],
+                "skill_evidence": skill_evidence[:20],
+                "career_gaps": career_gaps[:5],
+                "entrepreneurship_readiness": ent_score,
+                "transcript_summary": _summarize_transcript(transcript_data) if transcript_data else None,
+            })
+        except Exception:
+            fallback_used = True
+    timings["advisor_ms"] = round((time.perf_counter() - advisor_start) * 1000)
+
+    if session_id:
+        _persist_skill_evidence(session_id, normalized, skill_evidence)
 
     return {
         "skills_inventory": _categorize_skills(student_skill_names),
         "total_skills_identified": len(student_skill_names),
         "normalized_skills": normalized,
+        "skill_evidence": _merge_skill_evidence(normalized, skill_evidence),
         "entrepreneurship_readiness": ent_score,
         "career_gap_analysis": career_gaps,
         "experience_summary": experience_summary,
-        "ai_insights": ai_insights,
+        "ai_insights": _legacy_insights_from_advisor(local_advisor),
+        "local_advisor": local_advisor,
         "transcript_summary": _summarize_transcript(transcript_data) if transcript_data else None,
+        "intelligence": provider.metadata(fallback_used=fallback_used),
+        "performance": timings,
     }
 
 
@@ -235,6 +295,135 @@ def _analyze_career_gaps(student_skills: list) -> list:
     return results
 
 
+def _extract_missing_local_evidence(provider, source: str, parsed_data: dict | None) -> list:
+    """Ask the local provider for evidence if parser did not already attach it."""
+    if not parsed_data or parsed_data.get("skill_evidence"):
+        return []
+    raw_text = parsed_data.get("_raw_text", "")
+    if not raw_text.strip():
+        return []
+    return provider.extract_profile_evidence(source, raw_text)
+
+
+def _merge_skill_evidence(normalized: list, evidence: list) -> list:
+    """Merge duplicate evidence while adding canonical skill names when available."""
+    canonical_by_raw = {item["raw"]: item["canonical"] for item in normalized}
+    merged = {}
+    for item in evidence:
+        raw_skill = item.get("skill", "").strip()
+        if not raw_skill:
+            continue
+        canonical = canonical_by_raw.get(raw_skill, quick_normalize(raw_skill) or raw_skill)
+        key = (canonical, item.get("source", ""), item.get("evidence_text", ""))
+        current = merged.get(key)
+        normalized_item = {
+            "skill": canonical,
+            "raw_skill": raw_skill,
+            "evidence_text": item.get("evidence_text", ""),
+            "source": item.get("source", "resume"),
+            "confidence": round(float(item.get("confidence", 0.5)), 2),
+            "evidence_type": item.get("evidence_type", "inferred"),
+        }
+        if not current or normalized_item["confidence"] > current["confidence"]:
+            merged[key] = normalized_item
+    return sorted(merged.values(), key=lambda x: x["confidence"], reverse=True)
+
+
+def _persist_skill_evidence(session_id: str, normalized: list, evidence: list) -> None:
+    execute("DELETE FROM skill_evidence WHERE session_id = ?", (session_id,))
+    for item in _merge_skill_evidence(normalized, evidence):
+        execute(
+            """INSERT INTO skill_evidence
+            (session_id, canonical_skill, raw_skill, source, evidence_text, confidence, match_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                item.get("skill"),
+                item.get("raw_skill") or item.get("skill"),
+                item.get("source", "resume"),
+                item.get("evidence_text", ""),
+                item.get("confidence", 0.5),
+                item.get("evidence_type", "inferred"),
+            ),
+        )
+
+
+def _add_semantic_scores(provider, student_skills: list, evidence: list, gaps: list) -> tuple[list, int]:
+    """Add cached embedding-based scores without replacing deterministic overlap scoring."""
+    profile_text = "; ".join(
+        [item.get("evidence_text", "") for item in evidence if item.get("confidence", 0) >= 0.55][:20]
+        or student_skills
+    )
+    if not profile_text.strip():
+        return gaps, 0
+
+    cached_count = 0
+    profile_embedding = get_cached_embedding("profile", "current", provider, profile_text)
+    if profile_embedding:
+        cached_count += 1
+    else:
+        profile_embedding = provider.embed([profile_text])[0]
+        cache_embedding("profile", "current", provider, profile_text, profile_embedding)
+
+    updated = []
+    for gap in gaps:
+        career_text = " ".join([
+            gap.get("career_path", ""),
+            gap.get("industry", ""),
+            " ".join(gap.get("matching_skills", [])),
+            " ".join(gap.get("missing_essential_skills", [])),
+            " ".join(gap.get("missing_common_skills", [])),
+        ])
+        entity_id = f"{gap.get('career_path')}::{gap.get('industry')}"
+        career_embedding = get_cached_embedding("career_path", entity_id, provider, career_text)
+        if career_embedding:
+            cached_count += 1
+        else:
+            career_embedding = provider.embed([career_text])[0]
+            cache_embedding("career_path", entity_id, provider, career_text, career_embedding)
+
+        semantic = _cosine_similarity(profile_embedding, career_embedding)
+        combined = (gap.get("match_percentage", 0) * 0.6) + (semantic * 100 * 0.25) + (_average_confidence(evidence) * 100 * 0.15)
+        new_gap = {
+            **gap,
+            "semantic_match_score": round(semantic * 100, 1),
+            "combined_match_score": round(combined, 1),
+            "priority_missing_skills": gap.get("missing_essential_skills", [])[:5],
+        }
+        updated.append(new_gap)
+
+    updated.sort(key=lambda x: x.get("combined_match_score", x.get("match_percentage", 0)), reverse=True)
+    return updated, cached_count
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if not norm_a or not norm_b:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
+
+def _average_confidence(evidence: list) -> float:
+    values = [float(item.get("confidence", 0.5)) for item in evidence if item.get("confidence", 0) >= 0.55]
+    return sum(values) / len(values) if values else 0.5
+
+
+def _legacy_insights_from_advisor(advisor: dict | None) -> dict | None:
+    if not advisor:
+        return None
+    return {
+        "strengths": advisor.get("strengths", []),
+        "development_areas": advisor.get("development_areas", []),
+        "career_recommendations": [advisor.get("summary", "")] if advisor.get("summary") else [],
+        "immediate_actions": advisor.get("recommended_next_steps", []),
+        "entrepreneurship_assessment": advisor.get("summary", ""),
+    }
+
+
 def _summarize_experience(resume_data: dict = None, linkedin_data: dict = None) -> dict:
     """Summarize professional experience from resume and LinkedIn."""
     experiences = []
@@ -287,53 +476,3 @@ def _summarize_transcript(transcript_data: dict) -> dict:
         ],
     }
 
-
-def _get_ai_insights(resume_data: dict, linkedin_data: dict, transcript_data: dict, skills: list) -> dict:
-    """Get Claude-powered insights on the student's profile."""
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    profile_summary = json.dumps({
-        "skills": skills[:30],
-        "experience_count": len(resume_data.get("experience", [])) if resume_data else 0,
-        "education": resume_data.get("education", []) if resume_data else [],
-        "gpa": transcript_data.get("cumulative_gpa") if transcript_data else None,
-        "program": transcript_data.get("program") if transcript_data else "MBA",
-        "headline": linkedin_data.get("headline", "") if linkedin_data else "",
-    }, indent=2)
-
-    prompt = f"""You are a career advisor at Babson College. Analyze this MBA student's profile and provide actionable insights.
-
-Student profile:
-{profile_summary}
-
-Return ONLY valid JSON:
-{{
-  "strengths": ["Top 3 strengths based on their profile"],
-  "development_areas": ["Top 3 areas for growth"],
-  "career_recommendations": ["Top 3 career path suggestions with brief rationale"],
-  "immediate_actions": ["Top 3 specific, actionable next steps"],
-  "entrepreneurship_assessment": "1-2 sentence assessment of their readiness to launch a venture"
-}}"""
-
-    try:
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = response.content[0].text
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if json_match:
-            return json.loads(json_match.group())
-    except Exception:
-        pass
-
-    return {
-        "strengths": ["Profile analysis requires AI processing"],
-        "development_areas": ["Upload more documents for detailed analysis"],
-        "career_recommendations": ["Complete your profile for personalized recommendations"],
-        "immediate_actions": ["Add your resume and LinkedIn profile"],
-        "entrepreneurship_assessment": "Complete profile for assessment",
-    }

@@ -5,7 +5,6 @@ LinkedIn allows users to export their profile as a PDF. This module
 parses that PDF format to extract experience, skills, education, etc.
 """
 
-import json
 import re
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from ai.intelligence import get_intelligence_provider
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
@@ -26,64 +25,18 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
 
 def parse_with_ai(text: str) -> dict:
-    """Use Claude to extract structured LinkedIn profile data."""
-    if not ANTHROPIC_API_KEY:
-        return parse_rule_based(text)
-
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    prompt = f"""Analyze this LinkedIn profile PDF text and extract structured data. Return ONLY valid JSON:
-
-{{
-  "name": "Full name",
-  "headline": "Professional headline",
-  "location": "City, State/Country",
-  "about": "About/summary section text",
-  "experience": [
-    {{
-      "company": "Company name",
-      "title": "Job title",
-      "duration": "Duration string",
-      "location": "Location",
-      "description": "Role description"
-    }}
-  ],
-  "education": [
-    {{
-      "institution": "School name",
-      "degree": "Degree",
-      "field": "Field of study",
-      "dates": "Date range"
-    }}
-  ],
-  "skills": ["Skill 1", "Skill 2"],
-  "certifications": ["Cert 1"],
-  "languages": ["Language 1"],
-  "volunteer": ["Org 1"],
-  "recommendations_count": 0,
-  "connections_estimate": "500+"
-}}
-
-LinkedIn profile text:
-{text[:8000]}"""
-
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
+    """Use the configured local provider to enrich rule-based LinkedIn parsing."""
+    parsed = parse_rule_based(text)
     try:
-        content = response.content[0].text
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if json_match:
-            return json.loads(json_match.group())
-    except (json.JSONDecodeError, IndexError):
+        provider = get_intelligence_provider()
+        if provider.health().status == "ok":
+            evidence = provider.extract_profile_evidence("linkedin", text)
+            parsed["skill_evidence"] = evidence
+            local_skills = [item["skill"] for item in evidence if item.get("skill") and item.get("confidence", 0) >= 0.55]
+            parsed["skills"] = sorted(set(parsed.get("skills", []) + local_skills))
+    except Exception:
         pass
-
-    return parse_rule_based(text)
+    return parsed
 
 
 def parse_rule_based(text: str) -> dict:
