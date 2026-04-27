@@ -1,0 +1,11 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+pymupdf==1.23.7
+anthropic==0.39.0
+httpx==0.25.2
+beautifulsoup4==4.12.2
+lxml==4.9.4
+pandas==2.1.4
+aiofiles==23.2.1
+pydantic==2.5.2
