@@ -1,5 +1,7 @@
 # Babson MBA Career Intelligence Platform
 
+Note: This is a test of the Pokee AI tool.
+
 AI-powered career guidance platform for MBA students. Upload your resume and LinkedIn PDF, connect your academic transcript via Workday, and get personalized recommendations for courses, projects, and jobs based on skills gap analysis across 10 Boston-area MBA programs.
 
 ![Dashboard](https://img.shields.io/badge/Stack-FastAPI%20%2B%20Next.js-green)
